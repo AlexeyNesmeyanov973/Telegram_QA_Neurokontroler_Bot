@@ -96,19 +96,60 @@ def read_text_file(path: Path, limit_mb=15.0) -> str:
     data = path.read_bytes()[:int(limit_mb*1024*1024)]
     return data.decode("utf-8", errors="ignore")
 
-def transcode_to_wav(src_path: Path, sr: int = 16000) -> Path:
-    dst_path = src_path.with_suffix(".wav")
-    (
-        ffmpeg
-          .input(str(src_path))
-          .output(str(dst_path), ac=1, ar=sr, format="wav")
-          .overwrite_output()
-          .run(capture_stdout=True, capture_stderr=True)
-    )
-    return dst_path
-
 def esc(x: object) -> str:
-    return html_escape(str(x), quote=True)
+    from html import escape
+    return escape(str(x), quote=True)
+
+# ---- ffprobe helpers ----
+def ffprobe_json(path: Path) -> dict:
+    """Безопасный ffprobe: вернёт dict или бросит исключение с деталями."""
+    try:
+        return ffmpeg.probe(str(path))
+    except ffmpeg.Error as e:
+        raise RuntimeError(
+            f"ffprobe error: {e.stderr.decode('utf-8', 'ignore') if hasattr(e, 'stderr') else e}"
+        )
+
+def get_first_audio_stream(probe: dict) -> dict | None:
+    for s in probe.get("streams", []):
+        if s.get("codec_type") == "audio":
+            return s
+    return None
+
+def transcode_to_wav(src_path: Path, sr: int = 16000) -> Path:
+    """Надёжно перекодирует в WAV 16kHz mono. Проверяет наличие аудио-потока перед запуском."""
+    if not src_path.exists():
+        raise FileNotFoundError(f"Файл не найден: {src_path}")
+
+    probe = ffprobe_json(src_path)
+    astream = get_first_audio_stream(probe)
+    if not astream:
+        raise RuntimeError("В файле не найден аудиопоток. Пришлите аудио/видео с голосом.")
+
+    dst_path = src_path.with_suffix(".wav")
+    try:
+        (
+            ffmpeg
+            .input(str(src_path))
+            .output(
+                str(dst_path),
+                acodec="pcm_s16le",
+                ac=1,
+                ar=sr,
+                map="0:a:0",
+                format="wav"
+            )
+            .overwrite_output()
+            .global_args("-nostdin", "-loglevel", "error")
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+    except ffmpeg.Error as e:
+        err = e.stderr.decode("utf-8", "ignore") if hasattr(e, "stderr") else str(e)
+        raise RuntimeError(f"FFmpeg transcode failed:\n{err}")
+
+    if not dst_path.exists() or dst_path.stat().st_size == 0:
+        raise RuntimeError("Конвертация завершилась без вывода. Проверьте, что файл — корректное аудио/видео.")
+    return dst_path
 
 def file_preview(path: Path) -> Dict[str, Any]:
     """Короткое превью: имя, размер, тип, длительность (если медиа) или длина текста."""
@@ -276,7 +317,7 @@ from docx import Document
 def docx_report(analysis: dict, src_name: str, out_path: Path):
     doc = Document()
     doc.add_heading(f"Отчёт по контролю качества ({src_name})", 0)
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%М UTC")
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     doc.add_paragraph(f"Создано: {ts}")
 
     scores = analysis.get("scores", {})
@@ -436,14 +477,21 @@ async def handle_text_and_reply(text: str, message: Message, src_name: str):
 async def process_media_file(path: Path, message: Message, orig_name: str):
     await message.answer("🎧 Конвертирую и транскрибирую...")
     try:
+        probe = ffprobe_json(path)
+        if not get_first_audio_stream(probe):
+            await message.answer("⚠️ В файле не найден аудиопоток. Пришлите запись с голосом.")
+            return
+
         wav = transcode_to_wav(path)
         text = await openai_transcribe(wav)
     except Exception as e:
         await message.answer(f"⚠️ Ошибка транскрипции: {e}")
         return
+
     if not text.strip():
-        await message.answer("⚠️ Не удалось получить текст.")
+        await message.answer("⚠️ Не удалось получить текст из аудио. Попробуйте другой файл или ссылку.")
         return
+
     await handle_text_and_reply(text, message, src_name=orig_name)
 
 # ===========================================
@@ -648,13 +696,20 @@ async def cb_go_analyze(cb: CallbackQuery, state: FSMContext):
             await handle_text_and_reply(text, cb.message, src_name=src_name)
         elif src_type == "file":
             path = Path(data.get("file_path"))
+            suffix = path.suffix.lower()
             if is_text(path.name):
                 t = read_text_file(path)
                 await handle_text_and_reply(t, cb.message, src_name=src_name)
-            else:
+            elif suffix in (AUDIO_EXT | VIDEO_EXT):
                 await process_media_file(path, cb.message, orig_name=src_name)
+            else:
+                await cb.message.answer(
+                    "Файл не похож на аудио/видео/текст. Пришлите корректный формат или ссылку на медиа.",
+                    reply_markup=kb_main_menu()
+                )
         else:
             await cb.message.answer("Не понял тип источника. Начните заново.", reply_markup=kb_main_menu())
+
         await state.clear()
         await state.set_state(Flow.menu)
     except Exception as e:
