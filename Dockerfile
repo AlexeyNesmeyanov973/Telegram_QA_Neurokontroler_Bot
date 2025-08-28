@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-rus && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
