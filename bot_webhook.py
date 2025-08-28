@@ -84,6 +84,7 @@ if not HISTORY_FILE.exists():
 AUDIO_EXT = {".mp3",".wav",".m4a",".aac",".ogg",".oga",".flac",".webm"}
 VIDEO_EXT = {".mp4",".mov",".mkv",".avi",".webm"}
 TEXT_EXT  = {".txt",".md",".csv",".rtf"}
+IMAGE_EXT = {".jpg",".jpeg",".png",".webp",".bmp",".tif",".tiff"}
 
 def safe_filename(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.\-]+", "_", name).strip("._") or f"file_{uuid.uuid4().hex[:6]}"
@@ -91,6 +92,7 @@ def safe_filename(name: str) -> str:
 def is_audio(name: str) -> bool: return Path(name).suffix.lower() in AUDIO_EXT
 def is_video(name: str) -> bool: return Path(name).suffix.lower() in VIDEO_EXT
 def is_text(name: str)  -> bool: return Path(name).suffix.lower() in TEXT_EXT
+def is_image(name: str) -> bool: return Path(name).suffix.lower() in IMAGE_EXT
 
 def read_text_file(path: Path, limit_mb=15.0) -> str:
     data = path.read_bytes()[:int(limit_mb*1024*1024)]
@@ -167,6 +169,8 @@ def file_preview(path: Path) -> Dict[str, Any]:
         except Exception:
             info["type"] = "media"
             info["duration_sec"] = None
+    elif is_image(path.name):
+        info["type"] = "image"
     else:
         info["type"] = "unknown"
     return info
@@ -224,6 +228,18 @@ def filename_from_url(url: str, default: str = "file.bin") -> str:
     path = urlparse(url).path
     name = unquote(Path(path).name or default)
     return safe_filename(name)
+
+# === OCR (скриншоты/фото) ===
+from PIL import Image
+import pytesseract
+
+def ocr_image_to_text(path: Path) -> str:
+    """Распознаёт текст на изображении (rus+eng) и возвращает строку."""
+    img = Image.open(path).convert("RGB")
+    # лёгкая нормализация
+    # (без тяжёлых фильтров, чтобы работало быстро на Render)
+    text = pytesseract.image_to_string(img, lang="rus+eng")
+    return (text or "").strip()
 
 # =====================
 # OpenAI helpers (async)
@@ -591,7 +607,7 @@ async def cb_file(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Flow.waiting_file)
     asyncio.create_task(auto_clear(state))
     await cb.message.edit_text(
-        "Пришлите файл: 🎧 аудио / 🎥 видео / 📄 документ (txt/md/csv/rtf).\n"
+        "Пришлите файл: 🎧 аудио / 🎥 видео / 📄 документ (txt/md/csv/rtf) или 🖼️ изображение.\n"
         "Если файл больше ~20 МБ — пришлите ссылку (Google Drive/Яндекс.Диск/Dropbox/URL).",
         reply_markup=kb_cancel()
     )
@@ -619,6 +635,27 @@ async def handle_text_intake(msg: Message, state: FSMContext):
     preview_html = f"<b>Текст:</b> {len(txt)} символов\n\nНажмите «Начать анализ»."
     await msg.answer(preview_html, reply_markup=kb_confirm(), parse_mode="HTML")
 
+# --- фото как отдельный кейс (скриншоты чатов и т.п.)
+@rt.message(Flow.waiting_file, F.photo)
+async def handle_photo(msg: Message, state: FSMContext):
+    try:
+        photo = msg.photo[-1]  # лучшее качество
+        fname = safe_filename(f"photo_{photo.file_unique_id}.jpg")
+        dst = INBOX / fname
+        await bot.download(photo, destination=dst)
+
+        info = file_preview(dst)  # type=image
+        preview_html = (
+            f"<b>Изображение:</b> {esc(info.get('name'))} ({esc(info.get('size_kb'))} KB)\n"
+            "После подтверждения извлеку текст (OCR) и проанализирую."
+        )
+
+        await state.update_data(src_type="image", file_path=str(dst), src_name=fname)
+        await state.set_state(Flow.confirm)
+        await msg.answer(preview_html + "\n\nНажмите «Начать анализ».", reply_markup=kb_confirm(), parse_mode="HTML")
+    except Exception as e:
+        await msg.answer(f"Ошибка при получении изображения: {e}", reply_markup=kb_cancel())
+
 @rt.message(Flow.waiting_file, F.document | F.audio | F.voice | F.video | F.video_note)
 async def handle_file_intake(msg: Message, state: FSMContext):
     try:
@@ -642,6 +679,17 @@ async def handle_file_intake(msg: Message, state: FSMContext):
         fname = safe_filename(raw_name)
         dst = INBOX / fname
         await bot.download(file, destination=dst)
+
+        # Картинки, переданные как документ — пускаем в OCR
+        if is_image(fname):
+            await state.update_data(src_type="image", file_path=str(dst), src_name=fname)
+            await state.set_state(Flow.confirm)
+            await msg.answer(
+                f"<b>Изображение:</b> {esc(fname)} — извлеку текст (OCR) и проанализирую.\n\nНажмите «Начать анализ».",
+                reply_markup=kb_confirm(),
+                parse_mode="HTML"
+            )
+            return
 
         info = file_preview(dst)
         lines = [
@@ -681,6 +729,17 @@ async def handle_url_instead_of_file(msg: Message, state: FSMContext):
         await msg.answer("⬇️ Скачиваю файл по ссылке, подождите…")
         await download_via_http(url, dst, max_mb=MAX_HTTP_DOWNLOAD_MB)
 
+        # если картинка по ссылке — тоже OCR
+        if is_image(fname):
+            await state.update_data(src_type="image", file_path=str(dst), src_name=fname, expect_url=False)
+            await state.set_state(Flow.confirm)
+            await msg.answer(
+                f"<b>Изображение:</b> {esc(fname)} — извлеку текст (OCR) и проанализирую.\n\nНажмите «Начать анализ».",
+                reply_markup=kb_confirm(),
+                parse_mode="HTML"
+            )
+            return
+
         info = file_preview(dst)
         lines = [
             f"<b>Файл:</b> {esc(info.get('name'))} ({esc(info.get('size_kb'))} KB)",
@@ -710,6 +769,13 @@ async def cb_go_analyze(cb: CallbackQuery, state: FSMContext):
         if src_type == "text":
             text = data.get("text", "")
             await handle_text_and_reply(text, cb.message, src_name=src_name)
+        elif src_type == "image":
+            path = Path(data.get("file_path"))
+            text = ocr_image_to_text(path)
+            if len(text) < 20:
+                await cb.message.answer("⚠️ Не удалось извлечь текст со снимка. Попробуйте более чёткий скрин или пришлите текст/аудио.")
+            else:
+                await handle_text_and_reply(text, cb.message, src_name=src_name)
         elif src_type == "file":
             path = Path(data.get("file_path"))
             suffix = path.suffix.lower()
@@ -718,9 +784,15 @@ async def cb_go_analyze(cb: CallbackQuery, state: FSMContext):
                 await handle_text_and_reply(t, cb.message, src_name=src_name)
             elif suffix in (AUDIO_EXT | VIDEO_EXT):
                 await process_media_file(path, cb.message, orig_name=src_name)
+            elif suffix in IMAGE_EXT:
+                text = ocr_image_to_text(path)
+                if len(text) < 20:
+                    await cb.message.answer("⚠️ Не удалось извлечь текст со снимка. Попробуйте более чёткий скрин или пришлите текст/аудио.")
+                else:
+                    await handle_text_and_reply(text, cb.message, src_name=src_name)
             else:
                 await cb.message.answer(
-                    "Файл не похож на аудио/видео/текст. Пришлите корректный формат или ссылку на медиа.",
+                    "Файл не похож на аудио/видео/текст/изображение. Пришлите корректный формат или ссылку.",
                     reply_markup=kb_main_menu()
                 )
         else:
