@@ -5,7 +5,6 @@ from typing import Optional
 import ffmpeg
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
-from pydub import AudioSegment  # на всякий случай
 from datetime import datetime
 
 # === ENV ===
@@ -14,9 +13,9 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # придумай любой длинный секрет
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # можно не задавать на Render
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render задаст после деплоя
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")  # придумайте случайную длинную строку
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
     raise RuntimeError("Set env vars: OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET")
@@ -112,6 +111,7 @@ async def openai_quality_json(transcript_text: str) -> dict:
         except Exception as e:
             return {"raw": content, "error": f"JSON parse failed: {e}"}
 
+# --- Markdown отчёт ---
 def md_report(analysis: dict, src_name: str) -> str:
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     def get(path, default=None):
@@ -128,17 +128,20 @@ def md_report(analysis: dict, src_name: str) -> str:
         lines.append("")
     findings = get(["findings"], {})
     if isinstance(findings, dict):
-        if findings.get("time_objection_quotes"):
+        to = findings.get("time_objection_quotes") or []
+        if to:
             lines.append("## Фрагменты про возражение времени")
-            for q in findings["time_objection_quotes"][:8]: lines.append(f"> {q}")
+            for q in to[:8]: lines.append(f"> {q}")
             lines.append("")
-        if findings.get("key_strengths"):
+        ks = findings.get("key_strengths") or []
+        if ks:
             lines.append("## Сильные стороны")
-            for it in findings["key_strengths"][:8]: lines.append(f"- {it}")
+            for it in ks[:8]: lines.append(f"- {it}")
             lines.append("")
-        if findings.get("key_issues"):
+        ki = findings.get("key_issues") or []
+        if ki:
             lines.append("## Проблемы")
-            for it in findings["key_issues"][:10]: lines.append(f"- {it}")
+            for it in ki[:10]: lines.append(f"- {it}")
             lines.append("")
     actions = get(["actions"], [])
     if actions:
@@ -153,135 +156,36 @@ def md_report(analysis: dict, src_name: str) -> str:
         lines.append("")
     return "\n".join(lines)
 
-# === Aiogram v3 + FastAPI ===
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Update, Message, BufferedInputFile
-from aiogram.filters import CommandStart, Command
+# --- DOCX & PDF отчёты ---
+from docx import Document
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
 
-bot = Bot(TELEGRAM_BOT_TOKEN)
-dp = Dispatcher()
-rt = Router()
-dp.include_router(rt)
+def docx_report(analysis: dict, src_name: str, out_path: Path):
+    doc = Document()
+    doc.add_heading(f"Отчёт по контролю качества ({src_name})", 0)
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    doc.add_paragraph(f"Создано: {ts}")
 
-HELP = ("Я — Нейро-контролёр качества. Пришлите аудио/видео/файл c разговором или текст — пришлю оценку и рекомендации.\n\n"
-        "Команды:\n/start — приветствие\n/help — справка")
+    scores = analysis.get("scores", {})
+    if isinstance(scores, dict):
+        doc.add_heading("Оценки", level=1)
+        for k, v in scores.items():
+            p = doc.add_paragraph()
+            p.add_run(f"{k}: ").bold = True
+            p.add_run(str(v))
 
-@rt.message(CommandStart())
-async def on_start(message: Message):
-    await message.answer("Привет! " + HELP)
+    findings = analysis.get("findings", {})
+    if isinstance(findings, dict):
+        to = findings.get("time_objection_quotes") or []
+        if to:
+            doc.add_heading("Фрагменты про возражение времени", level=1)
+            for q in to[:8]:
+                doc.add_paragraph(q)
 
-@rt.message(Command("help"))
-async def on_help(message: Message):
-    await message.answer(HELP)
-
-async def handle_text_and_reply(text: str, message: Message, src_name: str):
-    await message.answer("🧠 Анализирую качество...")
-    analysis = await openai_quality_json(text)
-    report = md_report(analysis, src_name=src_name)
-    verdict = analysis.get("verdict") or "Готов отчёт."
-    await message.answer(f"✅ Готово: {verdict}")
-    out_name = f"report_{uuid.uuid4().hex[:8]}.md"; out_path = OUTBOX / out_name
-    with open(out_path, "w", encoding="utf-8") as f: f.write(report)
-    with open(out_path, "rb") as f:
-        await message.answer_document(BufferedInputFile(f.read(), filename=out_name), caption="Полный отчёт (Markdown)")
-
-async def process_media_file(path: Path, message: Message, orig_name: str):
-    await message.answer("🎧 Конвертирую и транскрибирую...")
-    wav = transcode_to_wav(path)
-    text = await openai_transcribe(wav)
-    if not (text and text.strip()):
-        await message.answer("⚠️ Не удалось получить транскрипт."); return
-    await handle_text_and_reply(text, message, src_name=orig_name)
-
-@rt.message(F.voice | F.audio)
-async def on_audio(message: Message):
-    try:
-        file = message.audio or message.voice
-        fname = (file.file_name if message.audio else "voice.ogg") or "audio.ogg"
-        dst = INBOX / safe_filename(fname)
-        await bot.download(file, destination=dst)
-        await process_media_file(dst, message, orig_name=fname)
-    except Exception as e:
-        await message.answer(f"Ошибка аудио: {e}")
-
-@rt.message(F.video | F.video_note)
-async def on_video(message: Message):
-    try:
-        file = message.video or message.video_note
-        fname = (message.video.file_name if message.video else "video_note.mp4") or "video.mp4"
-        dst = INBOX / safe_filename(fname)
-        await bot.download(file, destination=dst)
-        await process_media_file(dst, message, orig_name=fname)
-    except Exception as e:
-        await message.answer(f"Ошибка видео: {e}")
-
-@rt.message(F.document)
-async def on_document(message: Message):
-    try:
-        doc = message.document
-        fname = safe_filename(doc.file_name or f"file_{doc.file_unique_id}")
-        dst = INBOX / fname
-        await bot.download(doc, destination=dst)
-        if is_audio(fname) or is_video(fname):
-            await process_media_file(dst, message, orig_name=fname)
-        elif is_text(fname):
-            text = read_text_file(dst)
-            await handle_text_and_reply(text, message, src_name=fname)
-        else:
-            try:
-                await process_media_file(dst, message, orig_name=fname)
-            except Exception:
-                await message.answer("Формат файла не распознан как аудио/видео/текст.")
-    except Exception as e:
-        await message.answer(f"Ошибка документа: {e}")
-
-@rt.message(F.text)
-async def on_text(message: Message):
-    txt = message.text.strip()
-    if txt: await handle_text_and_reply(txt, message, src_name="text")
-
-# === FastAPI app ===
-app = FastAPI()
-
-@app.get("/", response_class=PlainTextResponse)
-async def root():
-    return "OK: neuro-qc-bot webhook"
-
-def build_webhook_url() -> str:
-    base = PUBLIC_BASE_URL or RENDER_EXTERNAL_URL
-    if not base:
-        raise RuntimeError("No PUBLIC_BASE_URL or RENDER_EXTERNAL_URL provided by Render.")
-    base = base.rstrip("/")
-    return f"{base}/webhook/{TELEGRAM_WEBHOOK_SECRET}"
-
-@app.on_event("startup")
-async def on_startup():
-    url = build_webhook_url()
-    # Ставим webhook при старте. Telegram будет присылать апдейты на наш URL.
-    await bot.set_webhook(
-        url,
-        secret_token=TELEGRAM_WEBHOOK_SECRET,
-        drop_pending_updates=True,
-        allowed_updates=["message","edited_message"]
-    )
-    print("Webhook set:", url)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-    except Exception:
-        pass
-
-@app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    # Банально проверим секрет в пути:
-    if secret != TELEGRAM_WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="forbidden")
-    data = await request.json()
-    try:
-        update = Update.model_validate(data)
-    except Exception:
-        raise HTTPException(status_code=400, detail="bad update")
-    await dp.feed_update(bot, update)
-    return JSONResponse({"ok": True})
+        ks = findings.get("key_strengths") or []
+        if ks:
+            doc.add_heading("Сильные стороны", level=1)
+            for it in ks[:8]:
+                doc.add_paragraph(f"• {_
