@@ -24,6 +24,10 @@ OPENAI_MODEL_CHAT       = os.getenv("OPENAI_MODEL_CHAT", "gpt-4o-mini")
 OPENAI_MODEL_TRANSCRIBE = os.getenv("OPENAI_MODEL_TRANSCRIBE", "gpt-4o-transcribe")
 OPENAI_MODEL_FALLBACK   = "whisper-1"
 
+# лимиты загрузок
+MAX_TG_DOWNLOAD_MB      = int(os.getenv("MAX_TG_DOWNLOAD_MB", "19"))    # лимит Telegram ~20MB
+MAX_HTTP_DOWNLOAD_MB    = int(os.getenv("MAX_HTTP_DOWNLOAD_MB", "200")) # по ссылке
+
 if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
     raise RuntimeError("Env vars required: OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET")
 
@@ -103,6 +107,9 @@ def transcode_to_wav(src_path: Path, sr: int = 16000) -> Path:
     )
     return dst_path
 
+def esc(x: object) -> str:
+    return html_escape(str(x), quote=True)
+
 def file_preview(path: Path) -> Dict[str, Any]:
     """Короткое превью: имя, размер, тип, длительность (если медиа) или длина текста."""
     info = {"name": path.name, "size_kb": round(path.stat().st_size / 1024, 1)}
@@ -143,6 +150,40 @@ def add_history_entry(report_id: str, src_name: str, analysis: dict):
         "verdict": verdict[:200]
     })
     HISTORY_FILE.write_text(json.dumps(hist, ensure_ascii=False, indent=2), encoding="utf-8")
+
+# формат размера
+def fmt_size(bytes_n: int) -> str:
+    v = float(bytes_n)
+    for unit in ["B","KB","MB","GB"]:
+        if v < 1024 or unit == "GB":
+            return f"{v:.1f} {unit}"
+        v /= 1024
+
+# === HTTP загрузка больших файлов ===
+import aiohttp
+from urllib.parse import urlparse, unquote
+
+async def download_via_http(url: str, dst: Path, max_mb: int = MAX_HTTP_DOWNLOAD_MB) -> None:
+    """Скачивает файл по HTTP(S) с ограничением размера."""
+    limit_bytes = max_mb * 1024 * 1024
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+            resp.raise_for_status()
+            size = 0
+            with open(dst, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1 << 14):
+                    size += len(chunk)
+                    if size > limit_bytes:
+                        f.close()
+                        dst.unlink(missing_ok=True)
+                        raise RuntimeError(f"Файл больше лимита {max_mb} МБ")
+                    f.write(chunk)
+
+def filename_from_url(url: str, default: str = "file.bin") -> str:
+    path = urlparse(url).path
+    name = unquote(Path(path).name or default)
+    return safe_filename(name)
 
 # =====================
 # OpenAI helpers (async)
@@ -235,7 +276,7 @@ from docx import Document
 def docx_report(analysis: dict, src_name: str, out_path: Path):
     doc = Document()
     doc.add_heading(f"Отчёт по контролю качества ({src_name})", 0)
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%М UTC")
     doc.add_paragraph(f"Создано: {ts}")
 
     scores = analysis.get("scores", {})
@@ -498,9 +539,7 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Отменено. Меню:", reply_markup=kb_main_menu())
     await cb.answer()
 
-# ЭКРАНИРУЕМ всё и используем parse_mode="HTML" для превью — чтобы не было Bad Request: can't parse entities
-def esc(x: object) -> str:
-    return html_escape(str(x), quote=True)
+URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 @rt.message(Flow.waiting_text, F.text)
 async def handle_text_intake(msg: Message, state: FSMContext):
@@ -520,8 +559,23 @@ async def handle_text_intake(msg: Message, state: FSMContext):
 async def handle_file_intake(msg: Message, state: FSMContext):
     try:
         file = msg.document or msg.audio or msg.voice or msg.video or msg.video_note
-        fname_raw = getattr(file, "file_name", None) or "file.bin"
-        fname = safe_filename(fname_raw)
+        file_size = getattr(file, "file_size", None) or getattr(file, "length", None) or 0
+        if file_size and file_size > MAX_TG_DOWNLOAD_MB * 1024 * 1024:
+            human = fmt_size(file_size)
+            await state.update_data(expect_url=True)
+            await msg.answer(
+                (
+                    f"Файл слишком большой для Bot API ({human} > {MAX_TG_DOWNLOAD_MB} MB).\n\n"
+                    "Пришлите <b>ссылку</b> на файл (Google Drive / Яндекс.Диск / Dropbox / прямой URL), "
+                    f"я скачаю его напрямую (до {MAX_HTTP_DOWNLOAD_MB} MB)."
+                ),
+                parse_mode="HTML",
+                reply_markup=kb_cancel()
+            )
+            return
+
+        raw_name = getattr(file, "file_name", None) or "file.bin"
+        fname = safe_filename(raw_name)
         dst = INBOX / fname
         await bot.download(file, destination=dst)
 
@@ -536,11 +590,50 @@ async def handle_file_intake(msg: Message, state: FSMContext):
             lines.append(f"<b>Длина:</b> {esc(info['chars'])} символов")
         preview_html = "\n".join(lines) + "\n\nНажмите «Начать анализ»."
 
-        await state.update_data(src_type="file", file_path=str(dst), src_name=fname)
+        await state.update_data(src_type="file", file_path=str(dst), src_name=fname, expect_url=False)
         await state.set_state(Flow.confirm)
         await msg.answer(preview_html, reply_markup=kb_confirm(), parse_mode="HTML")
+
     except Exception as e:
         await msg.answer(f"Ошибка при получении файла: {e}", reply_markup=kb_cancel())
+
+@rt.message(Flow.waiting_file, F.text)
+async def handle_url_instead_of_file(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("expect_url"):
+        await msg.answer("Жду файл (или нажмите Отмена).", reply_markup=kb_cancel())
+        return
+
+    txt = (msg.text or "").strip()
+    m = URL_RE.search(txt)
+    if not m:
+        await msg.answer("Пришлите, пожалуйста, прямую ссылку на файл.", reply_markup=kb_cancel())
+        return
+
+    url = m.group(0)
+    try:
+        fname = filename_from_url(url)
+        dst = INBOX / fname
+        await msg.answer("⬇️ Скачиваю файл по ссылке, подождите…")
+        await download_via_http(url, dst, max_mb=MAX_HTTP_DOWNLOAD_MB)
+
+        info = file_preview(dst)
+        lines = [
+            f"<b>Файл:</b> {esc(info.get('name'))} ({esc(info.get('size_kb'))} KB)",
+            f"<b>Тип:</b> {esc(info.get('type'))}",
+        ]
+        if info.get("duration_sec"):
+            lines.append(f"<b>Длительность:</b> {esc(info['duration_sec'])} сек")
+        if info.get("type") == "text" and info.get("chars") is not None:
+            lines.append(f"<b>Длина:</b> {esc(info['chars'])} символов")
+        preview_html = "\n".join(lines) + "\n\nНажмите «Начать анализ»."
+
+        await state.update_data(src_type="file", file_path=str(dst), src_name=fname, expect_url=False)
+        await state.set_state(Flow.confirm)
+        await msg.answer(preview_html, reply_markup=kb_confirm(), parse_mode="HTML")
+
+    except Exception as e:
+        await msg.answer(f"Не удалось скачать файл по ссылке: {e}", reply_markup=kb_cancel())
 
 @rt.callback_query(Flow.confirm, F.data == "flow:go")
 async def cb_go_analyze(cb: CallbackQuery, state: FSMContext):
