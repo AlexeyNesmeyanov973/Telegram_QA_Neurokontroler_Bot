@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: neuro-qc-bot-webhook
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      # PUBLIC_BASE_URL можно не задавать — Render подставит RENDER_EXTERNAL_URL
