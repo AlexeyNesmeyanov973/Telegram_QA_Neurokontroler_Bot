@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: neuro-qc-bot-webhook
-    env: docker
-    plan: free
-    autoDeploy: true
+    name: neuroqc-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
     envVars:
       - key: OPENAI_API_KEY
         sync: false
@@ -12,6 +12,7 @@ services:
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
       - key: MIN_TEXT_CHARS
-        sync: false
+        value: "120"
       - key: FSM_TIMEOUT
-        sync: false
+        value: "180"
+
