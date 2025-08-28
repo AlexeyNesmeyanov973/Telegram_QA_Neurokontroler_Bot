@@ -188,4 +188,254 @@ def docx_report(analysis: dict, src_name: str, out_path: Path):
         if ks:
             doc.add_heading("Сильные стороны", level=1)
             for it in ks[:8]:
-                doc.add_paragraph(f"• {_
+                doc.add_paragraph(f"• {it}")
+
+        ki = findings.get("key_issues") or []
+        if ki:
+            doc.add_heading("Проблемы", level=1)
+            for it in ki[:10]:
+                doc.add_paragraph(f"• {it}")
+
+    actions = analysis.get("actions") or []
+    if actions:
+        doc.add_heading("Рекомендации менеджеру", level=1)
+        for a in actions[:10]:
+            doc.add_paragraph(f"• {a}")
+
+    verdict = analysis.get("verdict")
+    if verdict:
+        doc.add_heading("Вывод", level=1)
+        doc.add_paragraph(verdict)
+
+    if "error" in analysis:
+        doc.add_paragraph("⚠️ JSON не распарсился — приложен сырой ответ в конце.")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out_path))
+
+def pdf_report(analysis: dict, src_name: str, out_path: Path):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(out_path), pagesize=A4)
+    width, height = A4
+    margin = 15 * mm
+    x = margin
+    y = height - margin
+
+    def writeln(text: str, leading=14):
+        nonlocal y
+        max_width = width - 2*margin
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        words = text.split()
+        line = ""
+        for w in words:
+            cand = (line + " " + w).strip()
+            if stringWidth(cand, "Helvetica", 11) <= max_width:
+                line = cand
+            else:
+                c.setFont("Helvetica", 11); c.drawString(x, y, line); y -= leading
+                if y < margin: c.showPage(); y = height - margin
+                line = w
+        if line:
+            c.setFont("Helvetica", 11); c.drawString(x, y, line); y -= leading
+            if y < margin: c.showPage(); y = height - margin
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    c.setFont("Helvetica-Bold", 14); c.drawString(x, y, f"Отчёт по контролю качества ({src_name})"); y -= 18
+    c.setFont("Helvetica", 10); c.drawString(x, y, f"Создано: {ts}"); y -= 16
+
+    scores = analysis.get("scores", {})
+    if isinstance(scores, dict) and scores:
+        c.setFont("Helvetica-Bold", 12); c.drawString(x, y, "Оценки"); y -= 16
+        for k, v in scores.items(): writeln(f"- {k}: {v}")
+
+    findings = analysis.get("findings", {})
+    if isinstance(findings, dict):
+        to = findings.get("time_objection_quotes") or []
+        if to:
+            c.setFont("Helvetica-Bold", 12); c.drawString(x, y, "Фрагменты про возражение времени"); y -= 16
+            for q in to[:8]: writeln(f"» {q}")
+
+        ks = findings.get("key_strengths") or []
+        if ks:
+            c.setFont("Helvetica-Bold", 12); c.drawString(x, y, "Сильные стороны"); y -= 16
+            for it in ks[:8]: writeln(f"• {it}")
+
+        ki = findings.get("key_issues") or []
+        if ki:
+            c.setFont("Helvetica-Bold", 12); c.drawString(x, y, "Проблемы"); y -= 16
+            for it in ki[:10]: writeln(f"• {it}")
+
+    actions = analysis.get("actions") or []
+    if actions:
+        c.setFont("Helvetica-Bold", 12); c.drawString(x, y, "Рекомендации менеджеру"); y -= 16
+        for a in actions[:10]: writeln(f"- {a}")
+
+    verdict = analysis.get("verdict")
+    if verdict:
+        c.setFont("Helvetica-Bold", 12); c.drawString(x, y, "Вывод"); y -= 16
+        writeln(verdict)
+
+    if "error" in analysis:
+        writeln("⚠️ JSON не распарсился — приложен сырой ответ в конце.")
+
+    c.showPage()
+    c.save()
+
+# === Aiogram v3 + FastAPI ===
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Update, Message, BufferedInputFile
+from aiogram.filters import CommandStart, Command
+
+bot = Bot(TELEGRAM_BOT_TOKEN)
+dp = Dispatcher()
+rt = Router()
+dp.include_router(rt)
+
+HELP = ("Я — Нейро-контролёр качества. Пришлите аудио/видео/файл c разговором или текст — пришлю оценку и рекомендации.\n\n"
+        "Команды:\n/start — приветствие\n/help — справка")
+
+@rt.message(CommandStart())
+async def on_start(message: Message):
+    await message.answer("Привет! " + HELP)
+
+@rt.message(Command("help"))
+async def on_help(message: Message):
+    await message.answer(HELP)
+
+async def handle_text_and_reply(text: str, message: Message, src_name: str):
+    await message.answer("🧠 Анализирую качество...")
+    analysis = await openai_quality_json(text)
+
+    # Markdown
+    out_base = f"report_{uuid.uuid4().hex[:8]}"
+    md_path  = OUTBOX / f"{out_base}.md"
+    report_md = md_report(analysis, src_name=src_name)
+    with open(md_path, "w", encoding="utf-8") as f: f.write(report_md)
+
+    # DOCX
+    docx_path = OUTBOX / f"{out_base}.docx"
+    try:
+        docx_report(analysis, src_name=src_name, out_path=docx_path)
+    except Exception:
+        docx_path = None
+
+    # PDF
+    pdf_path = OUTBOX / f"{out_base}.pdf"
+    try:
+        pdf_report(analysis, src_name=src_name, out_path=pdf_path)
+    except Exception:
+        pdf_path = None
+
+    verdict = analysis.get("verdict") or "Готов отчёт."
+    await message.answer(f"✅ Готово: {verdict}")
+
+    # Отправляем все доступные форматы
+    with open(md_path, "rb") as f:
+        await message.answer_document(BufferedInputFile(f.read(), filename=md_path.name), caption="Отчёт (Markdown)")
+    if docx_path and docx_path.exists():
+        with open(docx_path, "rb") as f:
+            await message.answer_document(BufferedInputFile(f.read(), filename=docx_path.name), caption="Отчёт (DOCX)")
+    if pdf_path and pdf_path.exists():
+        with open(pdf_path, "rb") as f:
+            await message.answer_document(BufferedInputFile(f.read(), filename=pdf_path.name), caption="Отчёт (PDF)")
+
+async def process_media_file(path: Path, message: Message, orig_name: str):
+    await message.answer("🎧 Конвертирую и транскрибирую...")
+    wav = transcode_to_wav(path)
+    text = await openai_transcribe(wav)
+    if not (text and text.strip()):
+        await message.answer("⚠️ Не удалось получить транскрипт."); return
+    await handle_text_and_reply(text, message, src_name=orig_name)
+
+@rt.message(F.voice | F.audio)
+async def on_audio(message: Message):
+    try:
+        file = message.audio or message.voice
+        fname = (file.file_name if message.audio else "voice.ogg") or "audio.ogg"
+        dst = INBOX / safe_filename(fname)
+        await bot.download(file, destination=dst)
+        await process_media_file(dst, message, orig_name=fname)
+    except Exception as e:
+        await message.answer(f"Ошибка аудио: {e}")
+
+@rt.message(F.video | F.video_note)
+async def on_video(message: Message):
+    try:
+        file = message.video or message.video_note
+        fname = (message.video.file_name if message.video else "video_note.mp4") or "video.mp4"
+        dst = INBOX / safe_filename(fname)
+        await bot.download(file, destination=dst)
+        await process_media_file(dst, message, orig_name=fname)
+    except Exception as e:
+        await message.answer(f"Ошибка видео: {e}")
+
+@rt.message(F.document)
+async def on_document(message: Message):
+    try:
+        doc = message.document
+        fname = safe_filename(doc.file_name or f"file_{doc.file_unique_id}")
+        dst = INBOX / fname
+        await bot.download(doc, destination=dst)
+        if is_audio(fname) or is_video(fname):
+            await process_media_file(dst, message, orig_name=fname)
+        elif is_text(fname):
+            text = read_text_file(dst)
+            await handle_text_and_reply(text, message, src_name=fname)
+        else:
+            try:
+                await process_media_file(dst, message, orig_name=fname)
+            except Exception:
+                await message.answer("Формат файла не распознан как аудио/видео/текст.")
+    except Exception as e:
+        await message.answer(f"Ошибка документа: {e}")
+
+@rt.message(F.text)
+async def on_text(message: Message):
+    txt = message.text.strip()
+    if txt: await handle_text_and_reply(txt, message, src_name="text")
+
+# === FastAPI app + webhook ===
+from aiogram.types import Update
+
+app = FastAPI()
+
+@app.get("/", response_class=PlainTextResponse)
+async def root():
+    return "OK: neuro-qc-bot webhook"
+
+def build_webhook_url() -> str:
+    base = PUBLIC_BASE_URL or RENDER_EXTERNAL_URL
+    if not base:
+        raise RuntimeError("No PUBLIC_BASE_URL or RENDER_EXTERNAL_URL provided by Render.")
+    base = base.rstrip("/")
+    return f"{base}/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+
+@app.on_event("startup")
+async def on_startup():
+    url = build_webhook_url()
+    await bot.set_webhook(
+        url,
+        secret_token=TELEGRAM_WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=["message","edited_message"]
+    )
+    print("Webhook set:", url)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    data = await request.json()
+    try:
+        update = Update.model_validate(data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad update")
+    await dp.feed_update(bot, update)
+    return JSONResponse({"ok": True})
