@@ -15,4 +15,5 @@ services:
         value: "120"
       - key: FSM_TIMEOUT
         value: "180"
-      # PUBLIC_BASE_URL можно не задавать: Render подставит RENDER_EXTERNAL_URL
+      # PUBLIC_BASE_URL опционально — Render подставит RENDER_EXTERNAL_URL
+
