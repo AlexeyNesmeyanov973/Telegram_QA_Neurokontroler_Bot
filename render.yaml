@@ -15,5 +15,9 @@ services:
         value: "120"
       - key: FSM_TIMEOUT
         value: "180"
-      # PUBLIC_BASE_URL опционально — Render подставит RENDER_EXTERNAL_URL
+      - key: MAX_TG_DOWNLOAD_MB
+        value: "19"
+      - key: MAX_HTTP_DOWNLOAD_MB
+        value: "200"
+
 
