@@ -1,27 +1,28 @@
 import os, re, json, uuid, asyncio, traceback
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Dict, Any
+from datetime import datetime
+from html import escape as html_escape
 
 import ffmpeg
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
-from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
 # =========================
-# ENV (все ключи из Render)
+# ENV (СЕКРЕТЫ ТОЛЬКО ИЗ Render)
 # =========================
-OPENAI_API_KEY         = os.getenv("OPENAI_API_KEY", "")
-TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_WEBHOOK_SECRET= os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
-PUBLIC_BASE_URL        = os.getenv("PUBLIC_BASE_URL")  # опционально (иначе Render даёт RENDER_EXTERNAL_URL)
-RENDER_EXTERNAL_URL    = os.getenv("RENDER_EXTERNAL_URL")  # проставляется Render
-MIN_TEXT_CHARS         = int(os.getenv("MIN_TEXT_CHARS", "120"))
-FSM_TIMEOUT            = int(os.getenv("FSM_TIMEOUT", "180"))  # сек
-OPENAI_MODEL_CHAT      = os.getenv("OPENAI_MODEL_CHAT", "gpt-4o-mini")
-OPENAI_MODEL_TRANSCRIBE= os.getenv("OPENAI_MODEL_TRANSCRIBE", "gpt-4o-transcribe")
-OPENAI_MODEL_FALLBACK  = "whisper-1"
+OPENAI_API_KEY          = os.getenv("OPENAI_API_KEY", "")
+TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+PUBLIC_BASE_URL         = os.getenv("PUBLIC_BASE_URL")  # опционально
+RENDER_EXTERNAL_URL     = os.getenv("RENDER_EXTERNAL_URL")  # Render подставит сам
+MIN_TEXT_CHARS          = int(os.getenv("MIN_TEXT_CHARS", "120"))
+FSM_TIMEOUT             = int(os.getenv("FSM_TIMEOUT", "180"))  # сек
+OPENAI_MODEL_CHAT       = os.getenv("OPENAI_MODEL_CHAT", "gpt-4o-mini")
+OPENAI_MODEL_TRANSCRIBE = os.getenv("OPENAI_MODEL_TRANSCRIBE", "gpt-4o-transcribe")
+OPENAI_MODEL_FALLBACK   = "whisper-1"
 
 if not OPENAI_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_WEBHOOK_SECRET:
     raise RuntimeError("Env vars required: OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET")
@@ -33,11 +34,10 @@ from openai import AsyncOpenAI
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 QUALITY_SYSTEM_PROMPT = (
-    "Ты — строгий контролёр качества звонков/диалогов обучения. "
-    "На входе транскрипт разговора менеджера с клиентом. "
-    "Нужно: (1) оценить общий уровень, (2) явно выявить, было ли возражение про время/длительность/темп, "
-    "(3) оценить отработку именно этого возражения, (4) дать рекомендации. "
-    "Верни строго валидный JSON по схеме:\n"
+    "Ты — строгий контролёр качества разговоров (менеджер ↔ клиент). "
+    "Твоя задача: (1) оценить общий уровень, (2) явно определить, было ли возражение о времени/длительности/темпе "
+    "и (3) оценить отработку именно этого возражения, (4) выдать рекомендации.\n"
+    "Верни СТРОГО ВАЛИДНЫЙ JSON без лишнего текста по схеме:\n"
     "{\n"
     '  "scores": {\n'
     '    "greeting": 0-5,\n'
@@ -58,7 +58,7 @@ QUALITY_SYSTEM_PROMPT = (
     '  "actions": ["..."],\n'
     '  "verdict": "1–2 предложения"\n'
     "}\n"
-    "Если данных для оценки нет — ставь 0 и укажи причину в key_issues. Пиши только JSON."
+    "Если данных для оценки нет, ставь 0 и укажи причину в key_issues. Пиши только JSON."
 )
 
 # ===========
@@ -148,8 +148,7 @@ def add_history_entry(report_id: str, src_name: str, analysis: dict):
 # OpenAI helpers (async)
 # =====================
 async def openai_transcribe(path: Path) -> str:
-    """Транскрипция через предпочтительную модель, затем fallback."""
-    # предпочтительная модель (gpt-4o-transcribe)
+    """Транскрипция: сначала prefer модель, затем fallback."""
     try:
         with open(path, "rb") as f:
             r = await client.audio.transcriptions.create(model=OPENAI_MODEL_TRANSCRIBE, file=f)
@@ -157,7 +156,7 @@ async def openai_transcribe(path: Path) -> str:
         if text: return text.strip()
     except Exception:
         pass
-    # fallback на whisper-1
+    # fallback
     with open(path, "rb") as f:
         r = await client.audio.transcriptions.create(model=OPENAI_MODEL_FALLBACK, file=f)
     text = getattr(r, "text", None) or (r.get("text") if isinstance(r, dict) else "")
@@ -174,7 +173,6 @@ async def openai_quality_json(transcript_text: str) -> dict:
         temperature=0.0
     )
     content = resp.choices[0].message.content
-    # выдернем JSON
     m = re.search(r"\{[\s\S]*\}", content or "")
     raw = m.group(0) if m else (content or "{}")
     try:
@@ -457,7 +455,6 @@ async def auto_clear(state: FSMContext, timeout=FSM_TIMEOUT):
     await asyncio.sleep(timeout)
     if await state.get_state():
         await state.clear()
-        # Сообщение пользователю не шлём (нет контекста)
 
 @rt.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
@@ -501,6 +498,10 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Отменено. Меню:", reply_markup=kb_main_menu())
     await cb.answer()
 
+# ЭКРАНИРУЕМ всё и используем parse_mode="HTML" для превью — чтобы не было Bad Request: can't parse entities
+def esc(x: object) -> str:
+    return html_escape(str(x), quote=True)
+
 @rt.message(Flow.waiting_text, F.text)
 async def handle_text_intake(msg: Message, state: FSMContext):
     txt = (msg.text or "").strip()
@@ -512,24 +513,32 @@ async def handle_text_intake(msg: Message, state: FSMContext):
         return
     await state.update_data(src_type="text", text=txt, src_name="text.txt")
     await state.set_state(Flow.confirm)
-    await msg.answer(f"Принял текст ({len(txt)} симв.). Нажмите «Начать анализ».", reply_markup=kb_confirm())
+    preview_html = f"<b>Текст:</b> {len(txt)} символов\n\nНажмите «Начать анализ»."
+    await msg.answer(preview_html, reply_markup=kb_confirm(), parse_mode="HTML")
 
 @rt.message(Flow.waiting_file, F.document | F.audio | F.voice | F.video | F.video_note)
 async def handle_file_intake(msg: Message, state: FSMContext):
     try:
         file = msg.document or msg.audio or msg.voice or msg.video or msg.video_note
-        fname = safe_filename(getattr(file, "file_name", None) or "file.bin")
+        fname_raw = getattr(file, "file_name", None) or "file.bin"
+        fname = safe_filename(fname_raw)
         dst = INBOX / fname
         await bot.download(file, destination=dst)
+
         info = file_preview(dst)
-        preview_lines = [f"**Файл:** {info['name']} ({info['size_kb']} KB)", f"**Тип:** {info['type']}"]
-        if "duration_sec" in info and info["duration_sec"]:
-            preview_lines.append(f"**Длительность:** {info['duration_sec']} сек")
-        if info.get("type")=="text" and info.get("chars") is not None:
-            preview_lines.append(f"**Длина:** {info['chars']} симв.")
+        lines = [
+            f"<b>Файл:</b> {esc(info.get('name'))} ({esc(info.get('size_kb'))} KB)",
+            f"<b>Тип:</b> {esc(info.get('type'))}",
+        ]
+        if info.get("duration_sec"):
+            lines.append(f"<b>Длительность:</b> {esc(info['duration_sec'])} сек")
+        if info.get("type") == "text" and info.get("chars") is not None:
+            lines.append(f"<b>Длина:</b> {esc(info['chars'])} символов")
+        preview_html = "\n".join(lines) + "\n\nНажмите «Начать анализ»."
+
         await state.update_data(src_type="file", file_path=str(dst), src_name=fname)
         await state.set_state(Flow.confirm)
-        await msg.answer("\n".join(preview_lines) + "\n\nНажмите «Начать анализ».", reply_markup=kb_confirm(), parse_mode="Markdown")
+        await msg.answer(preview_html, reply_markup=kb_confirm(), parse_mode="HTML")
     except Exception as e:
         await msg.answer(f"Ошибка при получении файла: {e}", reply_markup=kb_cancel())
 
@@ -565,7 +574,6 @@ async def cb_go_analyze(cb: CallbackQuery, state: FSMContext):
 
 @rt.message(F.text)
 async def fallback_text(msg: Message, state: FSMContext):
-    # Вне сценария — покажем меню
     if not await state.get_state():
         await state.set_state(Flow.menu)
         await msg.answer("Выберите вариант:", reply_markup=kb_main_menu())
