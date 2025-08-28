@@ -97,8 +97,7 @@ def read_text_file(path: Path, limit_mb=15.0) -> str:
     return data.decode("utf-8", errors="ignore")
 
 def esc(x: object) -> str:
-    from html import escape
-    return escape(str(x), quote=True)
+    return html_escape(str(x), quote=True)
 
 # ---- ffprobe helpers ----
 def ffprobe_json(path: Path) -> dict:
@@ -498,7 +497,10 @@ async def process_media_file(path: Path, message: Message, orig_name: str):
 # Aiogram v3 + FastAPI (guided flow)
 # ===========================================
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Update, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    Update, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand
+)
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -523,22 +525,29 @@ class Flow(StatesGroup):
     waiting_file = State()
     confirm = State()
 
-def kb_main_menu():
+def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔤 Анализировать текст", callback_data="flow:text")],
         [InlineKeyboardButton(text="📁 Загрузить файл (аудио/видео/док)", callback_data="flow:file")],
+        [InlineKeyboardButton(text="ℹ️ Справка", callback_data="flow:help")],
     ])
 
-def kb_confirm():
+def kb_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Начать анализ", callback_data="flow:go")],
         [InlineKeyboardButton(text="↩️ Отмена", callback_data="flow:cancel")]
     ])
 
-def kb_cancel():
+def kb_cancel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="↩️ Отмена", callback_data="flow:cancel")]
     ])
+
+def kb_reply_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="/start"), KeyboardButton(text="/help"), KeyboardButton(text="/cancel")]],
+        resize_keyboard=True
+    )
 
 async def auto_clear(state: FSMContext, timeout=FSM_TIMEOUT):
     await asyncio.sleep(timeout)
@@ -551,6 +560,7 @@ async def cmd_start(msg: Message, state: FSMContext):
     await state.set_state(Flow.menu)
     asyncio.create_task(auto_clear(state))
     await msg.answer("Привет! Выберите вариант:", reply_markup=kb_main_menu())
+    await msg.answer("Подсказки по командам:", reply_markup=kb_reply_menu())
 
 @rt.message(Command("help"))
 async def cmd_help(msg: Message, state: FSMContext):
@@ -560,6 +570,11 @@ async def cmd_help(msg: Message, state: FSMContext):
 async def cmd_cancel(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("Отмена. Вернулись в меню.", reply_markup=kb_main_menu())
+
+@rt.callback_query(F.data == "flow:help")
+async def cb_help(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.answer(HELP, reply_markup=kb_main_menu())
 
 @rt.callback_query(F.data == "flow:text")
 async def cb_text(cb: CallbackQuery, state: FSMContext):
@@ -576,7 +591,8 @@ async def cb_file(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Flow.waiting_file)
     asyncio.create_task(auto_clear(state))
     await cb.message.edit_text(
-        "Пришлите файл: 🎧 аудио / 🎥 видео / 📄 документ (txt/md/csv/rtf).",
+        "Пришлите файл: 🎧 аудио / 🎥 видео / 📄 документ (txt/md/csv/rtf).\n"
+        "Если файл больше ~20 МБ — пришлите ссылку (Google Drive/Яндекс.Диск/Dropbox/URL).",
         reply_markup=kb_cancel()
     )
     await cb.answer()
@@ -750,6 +766,12 @@ async def on_startup():
         drop_pending_updates=True,
         allowed_updates=["message","edited_message","callback_query"]
     )
+    # системные команды для «Меню» Telegram
+    await bot.set_my_commands([
+        BotCommand(command="start",  description="главное меню"),
+        BotCommand(command="help",   description="справка"),
+        BotCommand(command="cancel", description="отмена текущего шага"),
+    ])
     print("Webhook set:", url)
 
 from aiogram.types import Update
