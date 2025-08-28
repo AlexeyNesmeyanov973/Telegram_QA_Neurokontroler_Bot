@@ -1,11 +1,10 @@
-aiogram>=3.20.0
-openai>=1.40.0
-fastapi>=0.112.0
-uvicorn>=0.30.0
-ffmpeg-python>=0.2.0
-pydub>=0.25.1
-python-dotenv>=1.0.1
-tqdm>=4.67.0
+aiogram==3.4.1
+python-dotenv==1.0.1
+fastapi==0.111.0
+uvicorn==0.30.0
+openai==1.30.3
 python-docx==1.1.2
 reportlab==4.2.0
+ffmpeg-python==0.2.0
+aiofiles==23.2.1
 
