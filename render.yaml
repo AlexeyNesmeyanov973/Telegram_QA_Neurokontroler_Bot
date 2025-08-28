@@ -11,4 +11,7 @@ services:
         sync: false
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
-      # PUBLIC_BASE_URL можно не задавать — Render подставит RENDER_EXTERNAL_URL
+      - key: MIN_TEXT_CHARS
+        sync: false
+      - key: FSM_TIMEOUT
+        sync: false
